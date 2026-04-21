@@ -1,17 +1,18 @@
 """
 在线选股共振工具 - 后端 (Tushare Pro版)
 捕捞季节 + 神龙筹码 双指标共振选股
-自动筛选全市场股票
+自动筛选全市场股票（支持实时进度）
 """
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 import requests
 import pandas as pd
 import numpy as np
 import time
 import os
+import json
 
 app = FastAPI()
 
@@ -26,7 +27,6 @@ app.add_middleware(
 # Tushare Pro Token
 TUSHARE_TOKEN = "43c0a5c3a4743f32c0769f32dce1318863f8b99a09e881212f7514e1"
 
-# 获取当前脚本所在目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_PATH = os.path.join(os.path.dirname(BASE_DIR), "frontend", "index.html")
 
@@ -61,40 +61,6 @@ def tushare_api(api_name, params=None, fields=None, retries=3):
             print(f"请求失败 (尝试 {attempt+1}/{retries}): {e}")
             time.sleep(2)
     return pd.DataFrame()
-
-
-def get_all_stocks():
-    """获取所有股票列表"""
-    # 使用基础股票列表API
-    df = tushhare_api(
-        "stock_basic",
-        params={"exchange": "", "list_status": "L"},
-        fields="ts_code,symbol,name,area,industry,list_date"
-    )
-
-    if df.empty:
-        # 如果基础接口受限，使用备用方法
-        # 从常用指数成分股获取
-        indices = [
-            ("000852.SH", "中证1000"),
-            ("000905.SH", "中证500"),
-            ("000300.SH", "沪深300"),
-        ]
-        all_stocks = []
-        for idx_code, idx_name in indices:
-            df_idx = tushare_api(
-                "index_weight",
-                params={"index_code": idx_code},
-                fields="con_code"
-            )
-            if not df_idx.empty:
-                all_stocks.extend(df_idx["con_code"].tolist())
-
-        # 去重
-        all_stocks = list(set(all_stocks))
-        return all_stocks
-
-    return df["ts_code"].tolist()
 
 
 def get_stock_data(ts_code, count=60):
@@ -301,7 +267,6 @@ def check_advanced_filters(df, pledged):
 
 def analyze_single_stock(code, advanced="false"):
     """分析单只股票"""
-    # 转换代码格式
     if code.endswith(".SH") or code.endswith(".SZ"):
         ts_code = code
         simple_code = code.replace(".SH", "").replace(".SZ", "")
@@ -332,7 +297,6 @@ def analyze_single_stock(code, advanced="false"):
 
     return {
         "code": simple_code,
-        "name": simple_code,  # Tushare基础版没有name字段，用code代替
         "date": df.iloc[-1]["trade_date"],
         "close": round(df.iloc[-1]["close"], 2),
         "pledge": pledged,
@@ -343,94 +307,72 @@ def analyze_single_stock(code, advanced="false"):
     }
 
 
-def convert_code(code):
-    """股票代码转换"""
-    if code.startswith("6"):
-        return f"{code}.SH"
-    else:
-        return f"{code}.SZ"
-
-
 @app.get("/api/autoscreen")
 def auto_screen(advanced: str = "false", limit: str = "100"):
     """
-    自动筛选全市场股票
-    - advanced: 是否使用进阶版筛选
-    - limit: 最大筛选数量（默认100只，根据Tushare积分调整）
+    自动筛选全市场股票（SSE实时进度版）
     """
     try:
-        limit_num = min(int(limit), 500)  # 最多500只，防止超时
+        limit_num = min(int(limit), 500)
     except:
         limit_num = 100
 
-    print(f"开始自动筛选，限制: {limit_num}只")
+    def generate():
+        # 第一步：获取股票列表
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 5, 'message': '正在获取股票列表...'})}\n\n"
 
-    # 获取股票列表（先用中证500成分股测试）
-    stock_list = []
+        stock_list = []
+        df_500 = tushare_api("index_weight", params={"index_code": "000905.SH"}, fields="con_code")
+        if not df_500.empty:
+            stock_list.extend(df_500["con_code"].tolist())
 
-    # 中证500成分股
-    df_500 = tushare_api(
-        "index_weight",
-        params={"index_code": "000905.SH"},
-        fields="con_code"
-    )
-    if not df_500.empty:
-        stock_list.extend(df_500["con_code"].tolist())
+        df_300 = tushare_api("index_weight", params={"index_code": "000300.SH"}, fields="con_code")
+        if not df_300.empty:
+            stock_list.extend(df_300["con_code"].tolist())
 
-    # 沪深300成分股
-    df_300 = tushare_api(
-        "index_weight",
-        params={"index_code": "000300.SH"},
-        fields="con_code"
-    )
-    if not df_300.empty:
-        stock_list.extend(df_300["con_code"].tolist())
+        stock_list = list(set(stock_list))[:limit_num]
+        total = len(stock_list)
 
-    # 去重
-    stock_list = list(set(stock_list))[:limit_num]
-    print(f"获取到 {len(stock_list)} 只股票")
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 10, 'message': f'获取到 {total} 只股票，开始筛选...'})}\n\n"
 
-    results = []
-    共振股票 = []
-    checked = 0
-    skipped = 0
+        results = []
+        共振股票 = []
+        checked = 0
+        skipped = 0
 
-    for code in stock_list:
-        try:
-            result = analyze_single_stock(code, advanced)
-            checked += 1
+        for i, code in enumerate(stock_list):
+            try:
+                result = analyze_single_stock(code, advanced)
+                checked += 1
 
-            if result is None:
+                if result is None:
+                    skipped += 1
+                    continue
+
+                if result.get("basic共振"):
+                    共振股票.append(result)
+
+                results.append(result)
+
+                # 每10只或每20只发送一次进度更新
+                update_interval = 10 if total > 100 else 5
+                if checked % update_interval == 0 or checked == total:
+                    percent = min(10 + int(85 * checked / total), 95)
+                    yield f"data: {json.dumps({'type': 'progress', 'percent': percent, 'message': f'已检查 {checked}/{total} 只，共振 {len(共振股票)} 只'})}\n\n"
+
+                time.sleep(0.2)
+
+            except Exception as e:
                 skipped += 1
                 continue
 
-            if result.get("basic共振"):
-                共振股票.append(result)
+        # 完成
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 100, 'message': f'筛选完成！检查了 {checked} 只，找到 {len(共振股票)} 只共振信号'})}\n\n"
 
-            results.append(result)
+        # 返回最终结果
+        yield f"data: {json.dumps({'type': 'result', '共振股票': 共振股票, 'total_checked': checked, 'total_skipped': skipped, '共振数量': len(共振股票)})}\n\n"
 
-            # 每50只打印进度
-            if checked % 50 == 0:
-                print(f"进度: {checked}/{len(stock_list)}, 共振: {len(共振股票)}")
-
-            # 避免请求过快
-            time.sleep(0.3)
-
-        except Exception as e:
-            print(f"分析 {code} 时出错: {e}")
-            skipped += 1
-            continue
-
-    print(f"筛选完成: 检查 {checked} 只, 跳过 {skipped} 只, 共振 {len(共振股票)} 只")
-
-    return {
-        "total_checked": checked,
-        "total_skipped": skipped,
-        "共振数量": len(共振股票),
-        "共振股票": 共振股票,
-        "all_stocks": results[-20:] if results else [],  # 只返回最后20只作为样本
-        "message": f"检查了 {checked} 只股票，找到 {len(共振股票)} 只共振信号"
-    }
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @app.get("/api/analyze/{code}")
@@ -469,7 +411,7 @@ def batch_analyze(codes: str, advanced: str = "false"):
 
 @app.get("/api/screener")
 def screener(advanced: str = "false"):
-    """演示股票筛选（快捷筛选）"""
+    """演示股票筛选"""
     demo_codes = "600519,000858,002594,300750,600036,601318,000333,002415,600276,000001"
     return batch_analyze(demo_codes, advanced)
 
